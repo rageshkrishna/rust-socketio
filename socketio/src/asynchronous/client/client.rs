@@ -17,6 +17,7 @@ use crate::{
     asynchronous::socket::Socket as InnerSocket,
     error::{Error, Result},
     packet::{Packet, PacketId},
+    payload::AckData,
     Event, Payload,
 };
 
@@ -114,6 +115,35 @@ impl Client {
         self.socket.emit(&self.nsp, event.into(), data.into()).await
     }
 
+    pub async fn send_ack<D>(&self, data: D, ack_data: AckData) -> Result<()>
+    where
+        D: Into<Payload>,
+    {
+        let payload: Payload = data.into();
+        let packet = match payload {
+            Payload::BinaryAck(bin_data, _) | Payload::Binary(bin_data) => todo!(),
+            Payload::Text(mut data) | Payload::TextAck(mut data, _) => {
+                let mut payload_args = vec![];
+                payload_args.append(&mut data);
+                drop(data);
+
+                let payload = serde_json::Value::Array(payload_args).to_string();
+
+                Packet::new(
+                    PacketId::Ack,
+                    self.nsp.to_owned(),
+                    Some(payload),
+                    Some(ack_data.packet_id),
+                    0,
+                    None,
+                )
+            }
+            _ => unimplemented!(),
+        };
+
+        self.socket.send(packet).await
+    }
+
     /// Disconnects this client from the server by sending a `socket.io` closing
     /// packet.
     /// # Example
@@ -195,7 +225,7 @@ impl Client {
     ///                 Payload::String(str) => println!("{}", str),
     ///             }
     ///         }.boxed()
-    ///     };    
+    ///     };
     ///
     ///
     ///     let payload = json!({"token": 123});
@@ -349,8 +379,14 @@ impl Client {
                 )
             };
 
+            let payload: Payload = if let Some(packet_id) = packet.id {
+                Payload::TextAck(vec![data.clone()], AckData { packet_id })
+            } else {
+                (*data).clone().into()
+            };
+
             // call the correct callback
-            self.callback(&event, data.to_string()).await?;
+            self.callback(&event, payload).await?;
         }
 
         Ok(())
@@ -431,7 +467,7 @@ impl Client {
 #[cfg(test)]
 mod test {
 
-    use std::{sync::Arc, time::Duration};
+    use std::{collections::binary_heap, sync::Arc, time::Duration};
 
     use bytes::Bytes;
     use futures_util::{FutureExt, StreamExt};
@@ -461,6 +497,12 @@ mod test {
                         #[allow(deprecated)]
                         Payload::String(str) => println!("Received string: {}", str),
                         Payload::Binary(bin) => println!("Received binary data: {:#?}", bin),
+                        Payload::BinaryAck(bin, _ack) => {
+                            println!("Received binary data with ack: {:#?}", bin)
+                        }
+                        Payload::TextAck(values, _ack) => {
+                            println!("Received json with ack: {:#?}", values)
+                        }
                     }
                 }
                 .boxed()

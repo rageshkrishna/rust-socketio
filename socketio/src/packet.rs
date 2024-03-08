@@ -41,7 +41,7 @@ impl Packet {
         id: Option<i32>,
     ) -> Result<Packet> {
         match payload {
-            Payload::Binary(bin_data) => Ok(Packet::new(
+            Payload::BinaryAck(bin_data, _) | Payload::Binary(bin_data) => Ok(Packet::new(
                 if id.is_some() {
                     PacketId::BinaryAck
                 } else {
@@ -70,7 +70,7 @@ impl Packet {
                     None,
                 ))
             }
-            Payload::Text(mut data) => {
+            Payload::TextAck(mut data, _) | Payload::Text(mut data) => {
                 let mut payload_args = vec![serde_json::Value::String(event.to_string())];
                 payload_args.append(&mut data);
                 drop(data);

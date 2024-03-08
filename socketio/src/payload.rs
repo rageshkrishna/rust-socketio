@@ -1,5 +1,10 @@
 use bytes::Bytes;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AckData {
+    pub(crate) packet_id: i32,
+}
+
 /// A type which represents a `payload` in the `socket.io` context.
 /// A payload could either be of the type `Payload::Binary`, which holds
 /// data in the [`Bytes`] type that represents the payload or of the type
@@ -9,6 +14,10 @@ use bytes::Bytes;
 pub enum Payload {
     Binary(Bytes),
     Text(Vec<serde_json::Value>),
+    /// A text payload that requires acknowledgement
+    TextAck(Vec<serde_json::Value>, AckData),
+    /// A binary payload that requires acknowledgement
+    BinaryAck(Bytes, AckData),
     #[deprecated = "Use `Payload::Text` instead. Continue existing behavior with: Payload::from(String)"]
     /// String that is sent as JSON if this is a JSON string, or as a raw string if it isn't
     String(String),

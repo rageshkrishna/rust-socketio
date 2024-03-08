@@ -15,7 +15,11 @@ async fn main() {
         async move {
             match payload {
                 Payload::Text(values) => println!("Received: {:#?}", values),
+                Payload::TextAck(values, _ack) => println!("Received needing ack: {:#?}", values),
                 Payload::Binary(bin_data) => println!("Received bytes: {:#?}", bin_data),
+                Payload::BinaryAck(bin_data, _ack) => {
+                    println!("Received bytes needing ack: {:#?}", bin_data)
+                }
                 // Use Payload::Text instead
                 #[allow(deprecated)]
                 Payload::String(str) => println!("Received: {}", str),

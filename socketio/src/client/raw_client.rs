@@ -436,7 +436,13 @@ mod test {
                 #[allow(deprecated)]
                 Payload::String(str) => println!("Received string: {}", str),
                 Payload::Text(text) => println!("Received json: {:#?}", text),
+                Payload::TextAck(text, _ack) => {
+                    println!("Received json that requires ack: {:#?}", text)
+                }
                 Payload::Binary(bin) => println!("Received binary data: {:#?}", bin),
+                Payload::BinaryAck(bin, _ack) => {
+                    println!("Received binary data that requires ack: {:#?}", bin)
+                }
             })
             .connect()?;
 

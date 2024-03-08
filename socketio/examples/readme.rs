@@ -10,8 +10,12 @@ fn main() {
         match payload {
             #[allow(deprecated)]
             Payload::String(str) => println!("Received: {}", str),
-            Payload::Text(text) => println!("Received json: {:#?}", text),
-            Payload::Binary(bin_data) => println!("Received bytes: {:#?}", bin_data),
+            Payload::TextAck(text, _) | Payload::Text(text) => {
+                println!("Received json: {:#?}", text)
+            }
+            Payload::BinaryAck(bin_data, _) | Payload::Binary(bin_data) => {
+                println!("Received bytes: {:#?}", bin_data)
+            }
         }
         socket
             .emit("test", json!({"got ack": true}))
