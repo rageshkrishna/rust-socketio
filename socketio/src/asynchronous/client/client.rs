@@ -195,7 +195,7 @@ impl Client {
     ///                 Payload::String(str) => println!("{}", str),
     ///             }
     ///         }.boxed()
-    ///     };    
+    ///     };
     ///
     ///
     ///     let payload = json!({"token": 123});
@@ -213,7 +213,7 @@ impl Client {
         callback: F,
     ) -> Result<()>
     where
-        F: for<'a> std::ops::FnMut(Payload, Client) -> BoxFuture<'static, ()>
+        F: for<'a> std::ops::FnMut(Payload, Client, Option<i32>) -> BoxFuture<'static, ()>
             + 'static
             + Send
             + Sync,
@@ -237,7 +237,12 @@ impl Client {
         self.socket.send(socket_packet).await
     }
 
-    async fn callback<P: Into<Payload>>(&self, event: &Event, payload: P) -> Result<()> {
+    async fn callback<P: Into<Payload>>(
+        &self,
+        event: &Event,
+        payload: P,
+        packet_id: Option<i32>,
+    ) -> Result<()> {
         let mut on = self.on.write().await;
         let mut on_any = self.on_any.write().await;
 
@@ -246,14 +251,14 @@ impl Client {
         let payload = payload.into();
 
         if let Some(callback) = on_lock.get_mut(event) {
-            callback(payload.clone(), self.clone()).await;
+            callback(payload.clone(), self.clone(), packet_id).await;
         }
 
         // Call on_any for all common and custom events.
         match event {
             Event::Message | Event::Custom(_) => {
                 if let Some(callback) = on_any_lock {
-                    callback(event.clone(), payload, self.clone()).await;
+                    callback(event.clone(), payload, self.clone(), packet_id).await;
                 }
             }
             _ => (),
@@ -278,6 +283,7 @@ impl Client {
                             ack.callback.deref_mut()(
                                 Payload::from(payload.to_owned()),
                                 self.clone(),
+                                socket_packet.id,
                             )
                             .await;
                         }
@@ -286,6 +292,7 @@ impl Client {
                                 ack.callback.deref_mut()(
                                     Payload::Binary(payload.to_owned()),
                                     self.clone(),
+                                    socket_packet.id,
                                 )
                                 .await;
                             }
@@ -313,8 +320,12 @@ impl Client {
 
         if let Some(attachments) = &packet.attachments {
             if let Some(binary_payload) = attachments.get(0) {
-                self.callback(&event, Payload::Binary(binary_payload.to_owned()))
-                    .await?;
+                self.callback(
+                    &event,
+                    Payload::Binary(binary_payload.to_owned()),
+                    packet.id,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -350,7 +361,7 @@ impl Client {
             };
 
             // call the correct callback
-            self.callback(&event, data.to_string()).await?;
+            self.callback(&event, data.to_string(), packet.id).await?;
         }
 
         Ok(())
@@ -362,23 +373,24 @@ impl Client {
     #[inline]
     async fn handle_socketio_packet(&self, packet: &Packet) -> Result<()> {
         if packet.nsp == self.nsp {
+            eprintln!("Packet type: {:?}", packet.packet_type);
             match packet.packet_type {
                 PacketId::Ack | PacketId::BinaryAck => {
                     if let Err(err) = self.handle_ack(packet).await {
-                        self.callback(&Event::Error, err.to_string()).await?;
+                        self.callback(&Event::Error, err.to_string(), None).await?;
                         return Err(err);
                     }
                 }
                 PacketId::BinaryEvent => {
                     if let Err(err) = self.handle_binary_event(packet).await {
-                        self.callback(&Event::Error, err.to_string()).await?;
+                        self.callback(&Event::Error, err.to_string(), None).await?;
                     }
                 }
                 PacketId::Connect => {
-                    self.callback(&Event::Connect, "").await?;
+                    self.callback(&Event::Connect, "", None).await?;
                 }
                 PacketId::Disconnect => {
-                    self.callback(&Event::Close, "").await?;
+                    self.callback(&Event::Close, "", None).await?;
                 }
                 PacketId::ConnectError => {
                     self.callback(
@@ -388,12 +400,13 @@ impl Client {
                                 .data
                                 .as_ref()
                                 .unwrap_or(&String::from("\"No error message provided\"")),
+                        None,
                     )
                     .await?;
                 }
                 PacketId::Event => {
                     if let Err(err) = self.handle_event(packet).await {
-                        self.callback(&Event::Error, err.to_string()).await?;
+                        self.callback(&Event::Error, err.to_string(), None).await?;
                     }
                 }
             }
@@ -413,7 +426,7 @@ impl Client {
                 None => None,
                 Some(Err(err)) => {
                     // call the error callback
-                    match self.callback(&Event::Error, err.to_string()).await {
+                    match self.callback(&Event::Error, err.to_string(), None).await {
                         Err(callback_err) => Some((Err(callback_err), socket)),
                         Ok(_) => Some((Err(err), socket)),
                     }
@@ -454,7 +467,7 @@ mod test {
         let url = crate::test::socket_io_server();
 
         let socket = ClientBuilder::new(url)
-            .on("test", |msg, _| {
+            .on("test", |msg, _, _| {
                 async {
                     match msg {
                         Payload::Text(values) => println!("Received json: {:#?}", values),
@@ -478,7 +491,7 @@ mod test {
                 "test",
                 Payload::from(payload),
                 Duration::from_secs(1),
-                |message: Payload, socket: Client| {
+                |message: Payload, socket: Client, _| {
                     async move {
                         let result = socket
                             .emit("test", Payload::from(json!({"got ack": true})))
@@ -515,7 +528,7 @@ mod test {
         let notify_clone = notify.clone();
 
         let socket = ClientBuilder::new(url)
-            .on("test", move |_, _| {
+            .on("test", move |_, _, _| {
                 let cl = notify_clone.clone();
                 async move {
                     sleep(Duration::from_secs(1)).await;
@@ -555,10 +568,10 @@ mod test {
             .namespace("/admin")
             .tls_config(tls_connector)
             .opening_header("accept-encoding", "application/json")
-            .on("test", |str, _| {
+            .on("test", |str, _, _| {
                 async move { println!("Received: {:#?}", str) }.boxed()
             })
-            .on("message", |payload, _| {
+            .on("message", |payload, _, _| {
                 async move { println!("{:#?}", payload) }.boxed()
             })
             .connect()
@@ -576,7 +589,7 @@ mod test {
                 "binary",
                 json!("pls ack"),
                 Duration::from_secs(1),
-                |payload, _| async move {
+                |payload, _, _| async move {
                     println!("Yehaa the ack got acked");
                     println!("With data: {:#?}", payload);
                 }
@@ -606,10 +619,10 @@ mod test {
             .namespace("/admin")
             .tls_config(tls_connector)
             .opening_header("accept-encoding", "application/json")
-            .on("test", |str, _| {
+            .on("test", |str, _, _| {
                 async move { println!("Received: {:#?}", str) }.boxed()
             })
-            .on("message", |payload, _| {
+            .on("message", |payload, _, _| {
                 async move { println!("{:#?}", payload) }.boxed()
             })
             .connect_manual()
@@ -627,7 +640,7 @@ mod test {
                 "binary",
                 json!("pls ack"),
                 Duration::from_secs(1),
-                |payload, _| async move {
+                |payload, _, _| async move {
                     println!("Yehaa the ack got acked");
                     println!("With data: {:#?}", payload);
                 }
@@ -648,7 +661,7 @@ mod test {
         let mut _socket = ClientBuilder::new(url)
             .namespace("/")
             .auth(json!({ "password": "123" }))
-            .on_any(move |event, payload, _| {
+            .on_any(move |event, payload, _, _| {
                 let clone_tx = tx.clone();
                 async move {
                     if let Payload::Text(values) = payload {
@@ -839,7 +852,7 @@ mod test {
             )
         );
 
-        let cb = |message: Payload, _| {
+        let cb = |message: Payload, _, _| {
             async {
                 println!("Yehaa! My ack got acked?");
                 if let Payload::Text(values) = message {
