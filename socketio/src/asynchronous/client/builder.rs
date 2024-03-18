@@ -1,3 +1,4 @@
+use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use futures_util::{future::BoxFuture, StreamExt};
 use log::trace;
 use native_tls::TlsConnector;
@@ -5,7 +6,8 @@ use rust_engineio::{
     asynchronous::ClientBuilder as EngineIoClientBuilder,
     header::{HeaderMap, HeaderValue},
 };
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
+use tokio::time::sleep;
 use url::Url;
 
 use crate::{error::Result, Error, Event, Payload, TransportType};
@@ -22,13 +24,13 @@ use crate::asynchronous::socket::Socket as InnerSocket;
 /// acts the `build` method and returns a connected [`Client`].
 pub struct ClientBuilder {
     address: String,
-    on: HashMap<Event, Callback<DynAsyncCallback>>,
-    on_any: Option<Callback<DynAsyncAnyCallback>>,
-    namespace: String,
+    pub(crate) on: HashMap<Event, Callback<DynAsyncCallback>>,
+    pub(crate) on_any: Option<Callback<DynAsyncAnyCallback>>,
+    pub(crate) namespace: String,
     tls_config: Option<TlsConnector>,
     opening_headers: Option<HeaderMap>,
     transport_type: TransportType,
-    auth: Option<serde_json::Value>,
+    pub(crate) auth: Option<serde_json::Value>,
     pub(crate) reconnect: bool,
     pub(crate) reconnect_on_disconnect: bool,
     // None implies infinite attempts
@@ -383,16 +385,61 @@ impl ClientBuilder {
     /// }
     /// ```
     pub async fn connect(self) -> Result<Client> {
+        let reconnect_delay_min = self.reconnect_delay_min;
+        let reconnect_delay_max = self.reconnect_delay_max;
+        let max_reconnect_attempts = self.max_reconnect_attempts;
+
         let socket = self.connect_manual().await?;
-        let socket_clone = socket.clone();
+        let mut socket_clone = socket.clone();
 
         // Use thread to consume items in iterator in order to call callbacks
         tokio::runtime::Handle::current().spawn(async move {
-            let mut stream = socket_clone.as_stream();
-            // Consume the stream until it returns None and the stream is closed.
-            while let Some(item) = stream.next().await {
-                if let e @ Err(Error::IncompleteResponseFromEngineIo(_)) = item {
-                    trace!("Network error occurred: {}", e.unwrap_err());
+            loop {
+                let mut stream = socket_clone.as_stream();
+                // Consume the stream until it returns None and the stream is closed.
+                while let Some(item) = stream.next().await {
+                    // Where does this get thrown by the async client? :confused:
+                    if let e @ Err(Error::IncompleteResponseFromEngineIo(_)) = item {
+                        trace!("Network error occurred: {}", e.unwrap_err());
+                    }
+                }
+
+                // Drop the stream so we can once again use `socket_clone` as mutable
+                drop(stream);
+
+                if socket_clone.should_reconnect().await {
+                    let mut reconnect_attempts = 0;
+                    let mut backoff = ExponentialBackoffBuilder::new()
+                        .with_initial_interval(Duration::from_millis(reconnect_delay_min))
+                        .with_max_interval(Duration::from_millis(reconnect_delay_max))
+                        .build();
+
+                    loop {
+                        if let Some(max_reconnect_attempts) = max_reconnect_attempts {
+                            reconnect_attempts += 1;
+                            if reconnect_attempts > max_reconnect_attempts {
+                                // TODO: How to tell the app about this?
+                                trace!("Max reconnect attempts reached without success");
+                                break;
+                            }
+                        }
+                        match socket_clone.reconnect().await {
+                            Ok(_) => {
+                                trace!("Reconnected after {reconnect_attempts} attempts");
+                                break;
+                            }
+                            Err(e) => {
+                                trace!("Failed to reconnect: {e:?}");
+                                if let Some(delay) = backoff.next_backoff() {
+                                    let delay_ms = delay.as_millis();
+                                    trace!("Waiting for {delay_ms}ms before reconnecting");
+                                    sleep(delay).await;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    break;
                 }
             }
         });
@@ -400,9 +447,8 @@ impl ClientBuilder {
         Ok(socket)
     }
 
-    //TODO: 0.3.X stabilize
-    pub(crate) async fn connect_manual(self) -> Result<Client> {
-        // Parse url here rather than in new to keep new returning Self.
+    /// Creates a new Socket that can be used for reconnections
+    pub(crate) async fn inner_create(&self) -> Result<InnerSocket> {
         let mut url = Url::parse(&self.address)?;
 
         if url.path() == "/" {
@@ -411,11 +457,11 @@ impl ClientBuilder {
 
         let mut builder = EngineIoClientBuilder::new(url);
 
-        if let Some(tls_config) = self.tls_config {
-            builder = builder.tls_config(tls_config);
+        if let Some(tls_config) = &self.tls_config {
+            builder = builder.tls_config(tls_config.to_owned());
         }
-        if let Some(headers) = self.opening_headers {
-            builder = builder.headers(headers);
+        if let Some(headers) = &self.opening_headers {
+            builder = builder.headers(headers.to_owned());
         }
 
         let engine_client = match self.transport_type {
@@ -426,14 +472,14 @@ impl ClientBuilder {
         };
 
         let inner_socket = InnerSocket::new(engine_client)?;
+        Ok(inner_socket)
+    }
 
-        let socket = Client::new(
-            inner_socket,
-            &self.namespace,
-            self.on,
-            self.on_any,
-            self.auth,
-        )?;
+    //TODO: 0.3.X stabilize
+    pub(crate) async fn connect_manual(self) -> Result<Client> {
+        let inner_socket = self.inner_create().await?;
+
+        let socket = Client::new(inner_socket, self)?;
         socket.connect().await?;
 
         Ok(socket)

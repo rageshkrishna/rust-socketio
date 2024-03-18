@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ops::DerefMut, pin::Pin, sync::Arc};
+use std::{ops::DerefMut, pin::Pin, sync::Arc};
 
 use futures_util::{future::BoxFuture, stream, Stream, StreamExt};
 use log::trace;
@@ -11,7 +11,8 @@ use tokio::{
 
 use super::{
     ack::Ack,
-    callback::{Callback, DynAsyncAnyCallback, DynAsyncCallback},
+    builder::ClientBuilder,
+    callback::{Callback, DynAsyncCallback},
 };
 use crate::{
     asynchronous::socket::Socket as InnerSocket,
@@ -27,13 +28,14 @@ use crate::{
 pub struct Client {
     /// The inner socket client to delegate the methods to.
     socket: InnerSocket,
-    on: Arc<RwLock<HashMap<Event, Callback<DynAsyncCallback>>>>,
-    on_any: Arc<RwLock<Option<Callback<DynAsyncAnyCallback>>>>,
     outstanding_acks: Arc<RwLock<Vec<Ack>>>,
     // namespace, for multiplexing messages
     nsp: String,
     // Data send in the opening packet (commonly used as for auth)
     auth: Option<serde_json::Value>,
+    builder: Arc<RwLock<ClientBuilder>>,
+    manually_disconnected: Arc<RwLock<bool>>,
+    server_disconnected: Arc<RwLock<bool>>,
 }
 
 impl Client {
@@ -41,20 +43,15 @@ impl Client {
     /// namespace. If `None` is passed in as namespace, the default namespace
     /// `"/"` is taken.
     /// ```
-    pub(crate) fn new<T: Into<String>>(
-        socket: InnerSocket,
-        namespace: T,
-        on: HashMap<Event, Callback<DynAsyncCallback>>,
-        on_any: Option<Callback<DynAsyncAnyCallback>>,
-        auth: Option<serde_json::Value>,
-    ) -> Result<Self> {
+    pub(crate) fn new(socket: InnerSocket, builder: ClientBuilder) -> Result<Self> {
         Ok(Client {
             socket,
-            nsp: namespace.into(),
-            on: Arc::new(RwLock::new(on)),
-            on_any: Arc::new(RwLock::new(on_any)),
+            nsp: builder.namespace.to_owned(),
             outstanding_acks: Arc::new(RwLock::new(Vec::new())),
-            auth,
+            auth: builder.auth.clone(),
+            builder: Arc::new(RwLock::new(builder)),
+            manually_disconnected: Arc::new(RwLock::new(false)),
+            server_disconnected: Arc::new(RwLock::new(false)),
         })
     }
 
@@ -69,6 +66,15 @@ impl Client {
         let open_packet = Packet::new(PacketId::Connect, self.nsp.clone(), auth, None, 0, None);
 
         self.socket.send(open_packet).await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn reconnect(&mut self) -> Result<()> {
+        let builder = self.builder.write().await;
+        let socket = builder.inner_create().await?;
+        self.socket = socket;
+        self.connect().await?;
 
         Ok(())
     }
@@ -148,6 +154,10 @@ impl Client {
     /// }
     /// ```
     pub async fn disconnect(&self) -> Result<()> {
+        let mut manually_reconnected = self.manually_disconnected.write().await;
+        *manually_reconnected = true;
+        drop(manually_reconnected);
+
         let disconnect_packet =
             Packet::new(PacketId::Disconnect, self.nsp.clone(), None, None, 0, None);
 
@@ -195,7 +205,7 @@ impl Client {
     ///                 Payload::String(str) => println!("{}", str),
     ///             }
     ///         }.boxed()
-    ///     };    
+    ///     };
     ///
     ///
     ///     let payload = json!({"token": 123});
@@ -238,29 +248,23 @@ impl Client {
     }
 
     async fn callback<P: Into<Payload>>(&self, event: &Event, payload: P) -> Result<()> {
-        let mut on = self.on.write().await;
-        let mut on_any = self.on_any.write().await;
-
-        let on_lock = on.deref_mut();
-        let on_any_lock = on_any.deref_mut();
+        let mut builder = self.builder.write().await;
         let payload = payload.into();
 
-        if let Some(callback) = on_lock.get_mut(event) {
+        if let Some(callback) = builder.on.get_mut(event) {
             callback(payload.clone(), self.clone()).await;
         }
 
         // Call on_any for all common and custom events.
         match event {
             Event::Message | Event::Custom(_) => {
-                if let Some(callback) = on_any_lock {
+                if let Some(callback) = builder.on_any.as_mut() {
                     callback(event.clone(), payload, self.clone()).await;
                 }
             }
             _ => (),
         }
 
-        drop(on);
-        drop(on_any);
         Ok(())
     }
 
@@ -375,9 +379,13 @@ impl Client {
                     }
                 }
                 PacketId::Connect => {
+                    let mut server_disconnected = self.server_disconnected.write().await;
+                    *server_disconnected = false;
                     self.callback(&Event::Connect, "").await?;
                 }
                 PacketId::Disconnect => {
+                    let mut server_disconnected = self.server_disconnected.write().await;
+                    *server_disconnected = true;
                     self.callback(&Event::Close, "").await?;
                 }
                 PacketId::ConnectError => {
@@ -399,6 +407,17 @@ impl Client {
             }
         }
         Ok(())
+    }
+
+    pub(crate) async fn should_reconnect(&self) -> bool {
+        let manually_disconnected = *self.manually_disconnected.read().await;
+        let server_disconnected = *self.server_disconnected.read().await;
+
+        if server_disconnected {
+            self.builder.read().await.reconnect_on_disconnect
+        } else {
+            !manually_disconnected
+        }
     }
 
     /// Returns the packet stream for the client.
