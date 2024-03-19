@@ -29,6 +29,27 @@ use crate::{
     Event, Payload,
 };
 
+#[derive(Default)]
+pub struct ReconnectSettings {
+    // address: Option<String>,
+    auth: Option<serde_json::Value>,
+}
+
+impl ReconnectSettings {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // pub fn address(&mut self, address: String) -> &mut Self {
+    //     self.address = Some(address);
+    //     self
+    // }
+
+    pub fn auth(&mut self, auth: serde_json::Value) {
+        self.auth = Some(auth);
+    }
+}
+
 /// A socket which handles communication with the server. It's initialized with
 /// a specific address as well as an optional namespace to connect to. If `None`
 /// is given the client will connect to the default namespace `"/"`.
@@ -79,8 +100,13 @@ impl Client {
     }
 
     pub(crate) async fn reconnect(&mut self) -> Result<()> {
-        let builder = self.builder.write().await;
+        let mut builder = self.builder.write().await;
         let socket = builder.inner_create().await?;
+
+        if let Some(config) = builder.on_reconnect.as_mut() {
+            let reconnect_settings = config().await;
+            self.auth = reconnect_settings.auth;
+        }
 
         // New inner socket that can be connected
         let mut client_socket = self.socket.write().await;
